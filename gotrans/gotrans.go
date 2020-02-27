@@ -3,6 +3,7 @@ package gotrans
 import (
 	"fmt"
 	"reflect"
+	"sync"
 	"unsafe"
 )
 
@@ -24,8 +25,14 @@ type typeDesc struct {
 type TransFunc func(from, to, node, root unsafe.Pointer) error
 
 var (
-	globalTypeDescMap  = make(map[reflect.Type]*typeDesc)
-	globalTransFuncMap = make(map[string]TransFunc)
+	globalM = struct {
+		rwLK         sync.RWMutex
+		descMap      map[reflect.Type]*typeDesc
+		transFuncMap map[string]TransFunc
+	}{
+		descMap:      make(map[reflect.Type]*typeDesc),
+		transFuncMap: make(map[string]TransFunc),
+	}
 )
 
 func getKeyByField(fd *reflect.StructField) (string, string, string) {
@@ -57,13 +64,7 @@ __loop:
 		if _, err := getTypeDesc(tt); nil != err {
 			return false, err
 		}
-	case reflect.Map:
-		// 检查 map 的 key 是否为基本类型
-		if tt.Key().Kind() != reflect.String {
-			return true, nil
-		}
-		fallthrough
-	case reflect.Slice, reflect.Array, reflect.Ptr:
+	case reflect.Map, reflect.Slice, reflect.Array, reflect.Ptr:
 		tt = tt.Elem()
 		goto __loop
 	}
@@ -131,16 +132,8 @@ func (tdesc *typeDesc) walkStruct(rt reflect.Type) (err error) {
 					if nil != err {
 						return
 					}
-				case reflect.Slice, reflect.Array, reflect.Ptr:
+				case reflect.Map, reflect.Slice, reflect.Array, reflect.Ptr:
 					invalid, err = isInvalidType(fd.Type.Elem())
-					if nil != err {
-						return
-					}
-					if invalid {
-						continue
-					}
-				case reflect.Map:
-					invalid, err = isInvalidType(fd.Type)
 					if nil != err {
 						return
 					}
@@ -173,7 +166,7 @@ func (tdesc *typeDesc) walkStruct(rt reflect.Type) (err error) {
 		count--
 		tfd = &tdesc.Read[count]
 		if tfd.ToKey != "" {
-			if _, ok := globalTransFuncMap[tfd.FromKey]; !ok {
+			if _, ok := getTransFunc(tfd.FromKey); !ok {
 				return fmt.Errorf("function %s not found, at %v", tfd.FromKey, tfd.Type)
 			}
 			if _, ok := tdesc.Write[tfd.ToKey]; !ok {
@@ -185,22 +178,37 @@ func (tdesc *typeDesc) walkStruct(rt reflect.Type) (err error) {
 }
 
 func getTypeDesc(rt reflect.Type) (*typeDesc, error) {
-	if tdesc, ok := globalTypeDescMap[rt]; ok {
+	globalM.rwLK.RLock()
+	tdesc, ok := globalM.descMap[rt]
+	globalM.rwLK.RUnlock()
+	if ok {
 		return tdesc, nil
 	}
-	tdesc := &typeDesc{}
+	tdesc = &typeDesc{}
 	if err := tdesc.walkStruct(rt); nil != err {
 		return nil, err
 	}
-	globalTypeDescMap[rt] = tdesc
+	globalM.rwLK.Lock()
+	globalM.descMap[rt] = tdesc
+	globalM.rwLK.Unlock()
 	return tdesc, nil
 }
 
+func getTransFunc(name string) (TransFunc, bool) {
+	globalM.rwLK.RLock()
+	f, ok := globalM.transFuncMap[name]
+	globalM.rwLK.RUnlock()
+	return f, ok
+}
+
 func RegisterTransFunc(name string, f TransFunc) {
-	if _, ok := globalTransFuncMap[name]; ok {
+	globalM.rwLK.Lock()
+	if _, ok := globalM.transFuncMap[name]; ok {
+		globalM.rwLK.Unlock()
 		panic(fmt.Errorf("duplicate name %s", name))
 	}
-	globalTransFuncMap[name] = f
+	globalM.transFuncMap[name] = f
+	globalM.rwLK.Unlock()
 }
 
 func transValue(rv reflect.Value, rt reflect.Type, rk reflect.Kind, root unsafe.Pointer) (err error) {
@@ -226,7 +234,7 @@ func transValue(rv reflect.Value, rt reflect.Type, rk reflect.Kind, root unsafe.
 					vv = rv.Field(tfd.Index)
 				}
 				if tfd.ToKey != "" {
-					tfunc := globalTransFuncMap[tfd.FromKey]
+					tfunc, _ := getTransFunc(tfd.FromKey)
 					tfd = tdesc.Write[tfd.ToKey]
 					if nil != tfd.IndexArr {
 						vv2 = rv.FieldByIndex(tfd.IndexArr)
@@ -261,6 +269,8 @@ func transValue(rv reflect.Value, rt reflect.Type, rk reflect.Kind, root unsafe.
 		if rv.IsNil() {
 			return
 		}
+		rt = rt.Elem()
+		rk = rt.Kind()
 		for _, k := range rv.MapKeys() {
 			err = transValue(rv.MapIndex(k), rt, rk, root)
 			if nil != err {
