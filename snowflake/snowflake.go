@@ -50,8 +50,8 @@ func (self *snowFlake) NextId() (int64, error) {
 	if timestamp == self.lastTimestamp {
 		self.sequence = (self.sequence + 1) & 4095
 		if self.sequence == 0 {
-			// 借一毫秒
 			timestamp++
+			time.Sleep(time.Duration(timestamp*1e6 - time.Now().UnixNano()))
 		}
 	} else {
 		self.sequence = 0
